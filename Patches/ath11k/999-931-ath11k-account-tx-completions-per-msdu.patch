@@ -1,0 +1,99 @@
+From: Codex <codex@openai.com>
+Subject: [PATCH] wifi: ath11k: account TX completions when the MSDU is retired
+
+The downstream dp_tx performance patch subtracts every descriptor copied
+from the WBM completion ring from num_max_allowed before resolving its
+cookie. Descriptors with no live MSDU also decrement the counter, so it
+can become negative and report "tx completion mismatch" indefinitely.
+
+Restore one decrement for each successfully retired MSDU, including FW
+and TQM completions. Also account for frames reaped during radio stop or
+DP teardown; neither path receives a later TX completion. Invalidate the
+IDR slot when stop reaps it, matching the other retirement paths.
+Initialize the HTT completion skb pointer so an invalid ID cannot leave
+the ownership check reading an indeterminate value.
+
+Patch application verified against backports 7.2 plus the ath11k NSS patch series from
+ones20250/immortalwrt_ipq at 683480add1822fdfbbdee77856753d7282d58b71.
+Runtime behavior on JDCloud RE-CS-02 remains to be tested.
+
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -1053,6 +1053,7 @@
+ 			 DMA_TO_DEVICE);
+ 
+ 	dev_kfree_skb_any(msdu);
++	atomic_dec(&ab->num_max_allowed);
+ 
+ 	return 0;
+ }
+@@ -1085,6 +1086,7 @@
+ 
+ 			clear_bit(j, tx_ring->idrs);
+ 			tx_ring->idr_pool[j].buf = NULL;
++			tx_ring->idr_pool[j].id = -1;
+ 
+ 			dma_unmap_single(ab->dev, ATH11K_SKB_CB(msdu)->paddr,
+ 					 msdu->len, DMA_TO_DEVICE);
+@@ -1092,6 +1094,7 @@
+ 
+ 			if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 				wake_up(&ar->dp.tx_empty_waitq);
++			atomic_dec(&ab->num_max_allowed);
+ 		}
+ 		spin_unlock_bh(&tx_ring->tx_idr_lock);
+ 	}
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -405,6 +405,7 @@
+ 
+ 	if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 		wake_up(&ar->dp.tx_empty_waitq);
++	atomic_dec(&ab->num_max_allowed);
+ }
+ 
+ static void
+@@ -413,7 +414,7 @@
+ 				 struct ath11k_dp_htt_wbm_tx_status *ts)
+ {
+ 	struct ieee80211_tx_status status = {};
+-	struct sk_buff *msdu;
++	struct sk_buff *msdu = NULL;
+ 	struct ieee80211_tx_info *info;
+ 	struct ath11k_skb_cb *skb_cb;
+ 	struct ath11k *ar;
+@@ -443,6 +444,7 @@
+ 
+ 	if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 		wake_up(&ar->dp.tx_empty_waitq);
++	atomic_dec(&ab->num_max_allowed);
+ 
+ 	dma_unmap_single(ab->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
+ 
+@@ -889,12 +891,6 @@
+ 
+ 	spin_unlock_bh(&status_ring->lock);
+ 
+-	if (atomic_sub_return(count, &ab->num_max_allowed) < 0) {
+-		ath11k_warn(ab, "tx completion mismatch count %d ring id %d max_num %d\n",
+-			    count, tx_ring->tcl_data_ring_id,
+-			    atomic_read(&ab->num_max_allowed));
+-	}
+-
+ 	while (count--) {
+ 		msdu=NULL;
+ 		tx_status = &tx_ring->tx_status[i++];
+@@ -936,7 +932,13 @@
+ 			wake_up(&ar->dp.tx_empty_waitq);
+ 
+ 		ath11k_dp_tx_complete_msdu(ar, msdu, tx_status, buf_rel_source);
++		atomic_dec(&ab->num_max_allowed);
+ 	}
++
++	if (unlikely(atomic_read(&ab->num_max_allowed) < 0))
++		ath11k_warn(ab, "tx completion accounting underflow processed %d ring id %d outstanding %d\n",
++			    i, tx_ring->tcl_data_ring_id,
++			    atomic_read(&ab->num_max_allowed));
+ }
+ 
+ int ath11k_dp_tx_send_reo_cmd(struct ath11k_base *ab, struct dp_rx_tid *rx_tid,

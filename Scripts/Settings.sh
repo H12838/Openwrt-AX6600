@@ -1,5 +1,38 @@
 #!/bin/bash
 
+# Apply the locally reviewed ath11k fix only to the source tree it targets.
+if [[ "$WRT_SOURCE" == "ones20250/immortalwrt_ipq" ]]; then
+	ATH11K_PATCH_DIR="./package/kernel/mac80211/patches/nss/ath11k"
+	ATH11K_VENDOR_PATCH="$ATH11K_PATCH_DIR/244-ath11k-dp-tx-perf.patch"
+	if [[ ! -f "$ATH11K_VENDOR_PATCH" ]] ||
+	   ! grep -Fq 'tx completion mismatch count' "$ATH11K_VENDOR_PATCH"; then
+		echo "Expected ath11k TX completion patch is missing or changed" >&2
+		exit 1
+	fi
+	# 999-931: per-MSDU TX completion accounting; 999-932: HTT WBM status byte offset.
+	# 932 按文件名顺序在 931 之后应用, 两者都只改 ath11k dp_tx.c.
+	for ATH11K_FIX_NAME in \
+		999-931-ath11k-account-tx-completions-per-msdu.patch \
+		999-932-ath11k-fix-htt-wbm-status-offset.patch; do
+		ATH11K_SRC_PATCH="$GITHUB_WORKSPACE/Patches/ath11k/$ATH11K_FIX_NAME"
+		if [[ ! -f "$ATH11K_SRC_PATCH" ]]; then
+			echo "Missing local ath11k patch: $ATH11K_FIX_NAME" >&2
+			exit 1
+		fi
+		if [[ -e "$ATH11K_PATCH_DIR/$ATH11K_FIX_NAME" ]]; then
+			echo "ath11k fix path already exists upstream: $ATH11K_FIX_NAME" >&2
+			exit 1
+		fi
+		install -m 0644 "$ATH11K_SRC_PATCH" "$ATH11K_PATCH_DIR/$ATH11K_FIX_NAME" || exit 1
+	done
+	# 932 的补丁体必须仍是那一行字节偏移修正 (防止文件被误改/截断).
+	if ! grep -Fq 'status_desc = (void *)desc + HTT_TX_WBM_COMP_STATUS_OFFSET;' \
+		"$ATH11K_PATCH_DIR/999-932-ath11k-fix-htt-wbm-status-offset.patch"; then
+		echo "999-932 patch body changed (expected byte-offset fix)" >&2
+		exit 1
+	fi
+fi
+
 apply_sed_to_matches() {
 	local SEARCH_DIR=$1
 	local FILE_NAME=$2

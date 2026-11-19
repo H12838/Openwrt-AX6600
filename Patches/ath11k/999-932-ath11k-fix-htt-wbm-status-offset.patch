@@ -1,0 +1,32 @@
+From: Athena <root@athena>
+Subject: [PATCH] wifi: ath11k: use byte offset for the HTT WBM completion overlay
+
+HTT_TX_WBM_COMP_STATUS_OFFSET is a byte offset (8). The completion parser
+in ath11k_dp_tx_process_htt_tx_complete() adds it to a void pointer, which
+advances by bytes, and reads the overlaid HTT status word at desc + 8.
+The prefilter ath11k_dp_tx_completion_valid() casts desc to
+struct htt_tx_wbm_completion * first, so the same addition scales by the
+16-byte struct size and reads desc + 128 instead.
+
+When those unrelated bytes happen to decode as MEC_NOTIFY the prefilter
+discards a normal firmware completion: the caller never copies the
+descriptor, never retires its MSDU and never decrements num_tx_pending or
+num_max_allowed. On the JDCloud RE-CS-02 both AHB radios accumulated to
+8109 of the 8192 shared budget over four days, which stalls the TX path
+and produces repeated "failed to flush transmit queue" warnings.
+
+Use the same byte arithmetic as the parser so filtering and dispatch
+inspect the same overlay.
+
+---
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -839,7 +839,7 @@
+ 
+ 	if (FIELD_GET(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE, desc->info0) ==
+ 	    HAL_WBM_REL_SRC_MODULE_FW) {
+-		status_desc = ((struct htt_tx_wbm_completion *)desc) + HTT_TX_WBM_COMP_STATUS_OFFSET;
++		status_desc = (void *)desc + HTT_TX_WBM_COMP_STATUS_OFFSET;
+ 
+ 		/* Dont consider HTT_TX_COMP_STATUS_MEC_NOTIFY */
+ 		if (FIELD_GET(HTT_TX_WBM_COMP_INFO0_STATUS, status_desc->info0) ==
